@@ -1,1 +1,0 @@
-# Jenkins persistent data
