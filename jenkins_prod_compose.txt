@@ -1,0 +1,155 @@
+version: '3.8'
+
+services:
+  jenkins:
+    image: jenkins/jenkins:2.440.3-lts-jdk17
+    container_name: jenkins-master
+    restart: unless-stopped
+    user: root
+    privileged: true
+    environment:
+      - DOCKER_HOST=tcp://docker:2376
+      - DOCKER_CERT_PATH=/certs/client
+      - DOCKER_TLS_VERIFY=1
+      - JAVA_OPTS=-Djenkins.install.runSetupWizard=false -Xmx2048m -Djava.awt.headless=true
+      - JENKINS_OPTS=--sessionTimeout=1440
+      - JENKINS_ADMIN_EMAIL=${JENKINS_ADMIN_EMAIL}
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SMTP_USE_TLS=${SMTP_USE_TLS}
+      - SMTP_USE_SSL=${SMTP_USE_SSL}
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - docker_certs:/certs/client:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./jenkins/plugins.txt:/usr/share/jenkins/ref/plugins.txt
+      - ./jenkins/security.groovy:/usr/share/jenkins/ref/init.groovy.d/security.groovy
+      - ./jenkins/executors.groovy:/usr/share/jenkins/ref/init.groovy.d/executors.groovy
+      - ./jenkins/email-config.groovy:/usr/share/jenkins/ref/init.groovy.d/email-config.groovy
+      - ./logs:/var/log/jenkins
+    networks:
+      - jenkins
+    depends_on:
+      - docker
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/login"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+
+  docker:
+    image: docker:24.0.7-dind
+    container_name: jenkins-docker
+    restart: unless-stopped
+    privileged: true
+    environment:
+      - DOCKER_TLS_CERTDIR=/certs
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - docker_certs:/certs/client
+      - docker_data:/var/lib/docker
+    ports:
+      - "2376:2376"
+    networks:
+      - jenkins
+    command: --storage-driver overlay2 --insecure-registry=localhost:5000
+
+  nginx:
+    image: nginx:1.25.3-alpine
+    container_name: jenkins-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./logs:/var/log/nginx
+    networks:
+      - jenkins
+    depends_on:
+      - jenkins
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  jenkins-agent:
+    image: jenkins/inbound-agent:4.13.3-1-jdk17
+    container_name: jenkins-agent-1
+    restart: unless-stopped
+    environment:
+      - JENKINS_URL=http://jenkins:8080
+      - JENKINS_AGENT_NAME=docker-agent-1
+      - JENKINS_SECRET=${JENKINS_AGENT_SECRET}
+      - JENKINS_AGENT_WORKDIR=/home/jenkins/agent
+    volumes:
+      - agent_workspace:/home/jenkins/agent
+      - docker_certs:/certs/client:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - jenkins
+    depends_on:
+      - jenkins
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+
+  backup:
+    image: alpine:3.19
+    container_name: jenkins-backup
+    restart: "no"
+    volumes:
+      - jenkins_home:/jenkins_home:ro
+      - ./backups:/backups
+    networks:
+      - jenkins
+    command: >
+      sh -c "
+        apk add --no-cache tar gzip &&
+        cd /jenkins_home &&
+        tar -czf /backups/jenkins-backup-$$(date +%Y%m%d-%H%M%S).tar.gz \
+          --exclude='workspace' \
+          --exclude='builds/*/archive' \
+          --exclude='*.log' \
+          .
+      "
+    profiles:
+      - backup
+
+volumes:
+  jenkins_home:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${PWD}/jenkins_home
+  docker_certs:
+    driver: local
+  docker_data:
+    driver: local
+  agent_workspace:
+    driver: local
+
+networks:
+  jenkins:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# Logging configuration
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
